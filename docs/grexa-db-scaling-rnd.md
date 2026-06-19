@@ -260,9 +260,15 @@ is where "records are files" actually costs you.
 
 ## Combined roadmap
 
-1. **Quick wins (no index):** rayon + hand-parse + lazy body + drop sort + CLI
-   path-list fix + top-K/keys-only `order_by`. → ~10× filter, ~26,000× sort
-   memory. Days of work, zero format change, zero risk to the invariant.
+1. **Quick wins (no index):** parallel scan + hand-parse + lazy body + drop sort
+   + top-K/keys-only `order_by`. → ~10× filter, ~26,000× sort memory. Zero
+   format change, zero risk to the invariant.
+   **Status — parallel scan SHIPPED** (commit `0f26dcf`): `std::thread`
+   work-stealing, *no new dependencies* (rayon was unnecessary), behind
+   `Query::collect_par`. Measured end-to-end on the CLI at 200k records:
+   selective filter **4.8×**, broad filter **3.7×**, list **2.6×**, `order_by`
+   **2.0×** — byte-identical output, 124 tests green. The hand-parse fast-path
+   and top-K/keys-only `order_by` remain to reach the full ~10× / memory wins.
 2. **Index v1:** eq/contains-only, manual rebuild, drift⇒bypass. → selective
    queries ~1,000×.
 3. **Index v2:** ranges, `ne`, multi-filter intersection, index-only count/paths,
