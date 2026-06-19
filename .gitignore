@@ -3,6 +3,12 @@
 **/*.orig
 *.log
 
+# Python
+__pycache__/
+
+# Generated benchmark output (machine-specific; regenerate with scripts/bench.py)
+/scripts/bench-results.json
+
 # Editor / OS
 .DS_Store
 .vscode/
