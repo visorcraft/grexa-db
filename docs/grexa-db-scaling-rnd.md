@@ -23,19 +23,28 @@ engine-owned log.**
 
 ## Executive summary
 
-| # | Bottleneck | Verdict | Lever | Measured / bound | Format change |
-|---|---|---|---|---|---|
-| 2+4 | per-record I/O + YAML parse | **solved** | rayon + hand-parse + head-read | **10.1×** (924→92 ms) | none |
-| 1 | no index → O(n) scan | **solved** | sidecar inverted/columnar index | **1,204×** selective; count ~instant | none (sidecar) |
-| 5 | order_by buffers everything | **solved** | top-K heap + keys-only | **26,277×** less memory | none |
-| 3 | large-directory degradation | **non-issue to 1M** | adaptive shard, on-disk only, past ~100k | linear to 1M; no knee | (deferred) |
-| 6 | inode/storage amplification | **irreducible — the real ceiling** | accept; it's the rent for transparency | ~18× disk, ~270× delete @500k | — |
+| # | Bottleneck | Status | Lever | Measured (shipped) |
+|---|---|---|---|---|
+| 2 | per-record I/O | **SHIPPED** | `std::thread` work-stealing parallel scan (no deps) | **2–5×** end-to-end (selective filter 4.8×) |
+| 4 | YAML parse cost | **prototyped, not shipped** | hand-rolled frontmatter fast-path | prototype ~2.9× (quality risk — held back) |
+| 1 | no index → O(n) scan | **SHIPPED** (held handle) | derived `.grexa-index/` sidecar + verify-on-read | **297×** selective, held in memory |
+| 5 | order_by buffers everything | **SHIPPED** | bounded top-K via `.limit()` | **O(k)** memory, not O(matches) |
+| 3 | large-directory degradation | **non-issue to 1M** | adaptive shard, on-disk only, past ~100k | linear to 1M; no knee |
+| 6 | inode/storage amplification | **irreducible — the real ceiling** | accept; it's the rent for transparency | ~18× disk, ~270× delete @500k |
 
-Stacked, a selective query goes from **~924 ms → ~0.1 ms** with every record
-still a plain file. The honest crossover where a real DB wins moves from the
-spec's ~250k toward low millions; #6 (and the staleness-reconciliation tax)
-keeps *a* ceiling — the design goal is to widen the sweet spot, not pretend
-there's no ceiling.
+> **Honest note on the index (#1).** The first attempt auto-loaded the index on
+> every query — a 30 MB JSON parse + an O(n) freshness `stat` per query — which
+> made a *cold* CLI query **slower** than the parallel scan (523 ms vs 192 ms).
+> It was reverted. The shipped design is a **caller-held in-memory handle**: a
+> long-lived process (Grexa's Database browser) loads it once and keeps it fresh
+> with `inotify` + `reconcile`; only then does the **297×** land. Cold one-shot
+> CLI queries deliberately do **not** use it — they scan, with no regression.
+> The earlier "~1,000×" figure was the unrealistic no-load/no-freshness case.
+
+Stacked in a persistent process, a selective query goes from **~190 ms → ~0.6 ms**
+with every record still a plain file. The honest crossover where a real DB wins
+moves from the spec's ~250k toward low millions; #6 keeps *a* ceiling — the
+design goal is to widen the sweet spot, not pretend there's no ceiling.
 
 ## Methodology
 
@@ -260,22 +269,23 @@ is where "records are files" actually costs you.
 
 ## Combined roadmap
 
-1. **Quick wins (no index):** parallel scan + hand-parse + lazy body + drop sort
-   + top-K/keys-only `order_by`. → ~10× filter, ~26,000× sort memory. Zero
-   format change, zero risk to the invariant.
-   **Status — parallel scan SHIPPED** (commit `0f26dcf`): `std::thread`
-   work-stealing, *no new dependencies* (rayon was unnecessary), behind
-   `Query::collect_par`. Measured end-to-end on the CLI at 200k records:
-   selective filter **4.8×**, broad filter **3.7×**, list **2.6×**, `order_by`
-   **2.0×** — byte-identical output, 124 tests green. The hand-parse fast-path
-   and top-K/keys-only `order_by` remain to reach the full ~10× / memory wins.
-2. **Index v1:** eq/contains-only, manual rebuild, drift⇒bypass. → selective
-   queries ~1,000×.
-3. **Index v2:** ranges, `ne`, multi-filter intersection, index-only count/paths,
-   index-ordered `order_by`.
-4. **Incremental reconcile** (notmuch-style staleness) so edits don't rebuild.
-5. **Adaptive sharding** only once the directory knee is actually hit.
+1. **Parallel scan — ✅ SHIPPED** (`0f26dcf`): `std::thread` work-stealing, no
+   new deps, behind `Query::collect_par`. End-to-end at 200k: selective filter
+   **4.8×**, broad **3.7×**, list **2.6×**, `order_by` **2.0×**, byte-identical.
+2. **Index — ✅ SHIPPED** (`6a176bd`): a caller-**held** `.grexa-index/` sidecar
+   (eq/contains, verify-on-read, `reconcile`, selectivity guard). **297×** on a
+   selective query held in memory; never auto-loaded (cold-load was a regression).
+   Wired into Grexa's Database browser with `inotify` (`4e43315` in the app repo).
+3. **Top-K `order_by` — ✅ SHIPPED** (`86f7c27`): `Query::limit(k)` fuses into a
+   parallel bounded top-K, **O(k)** memory instead of buffering every match.
+4. **Index v2 — not yet:** ranges/`ne` (order-preserving keys), a binary format
+   (faster build/load), O(changes) reconcile, parallel candidate reads. Mostly
+   narrows the cases that still scan; medium value.
+5. **Frontmatter fast-path (#4) — not shipped:** ~2.9× on the cold scan, but a
+   hand-rolled YAML parser whose resolution must match `serde` exactly. Real
+   quality risk; only ship behind an exhaustive differential test.
+6. **Adaptive sharding (#3)** — only once the directory knee is actually hit
+   (measured: not before ~1M, and only on real disk).
 
-After 1–4 the practical crossover plausibly moves from ~250k toward low
-millions, every record still a plain file. #6 sets the final ceiling — by
-design.
+Items 1–3 are live. After 4 the practical crossover plausibly moves toward low
+millions, every record still a plain file. #6 sets the final ceiling — by design.

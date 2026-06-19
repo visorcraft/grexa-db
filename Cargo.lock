@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "grexa-db"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "serde_json",
  "serde_yaml_ng",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "grexa-db-cli"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "clap",
  "grexa-db",
