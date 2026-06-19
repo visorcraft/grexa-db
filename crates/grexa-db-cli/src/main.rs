@@ -80,13 +80,11 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Records { collection } => {
             let coll = db.collection(collection)?;
-            let mut count = 0;
-            for result in coll.records() {
-                let record = result?;
+            let records = coll.query().collect_par()?;
+            for record in &records {
                 println!("{}", record.path());
-                count += 1;
             }
-            eprintln!("{count} records");
+            eprintln!("{} records", records.len());
         }
 
         Command::Query {
@@ -114,13 +112,11 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     query.order_by(field).asc()
                 };
             }
-            let mut count = 0;
-            for result in query {
-                let record = result?;
+            let records = query.collect_par()?;
+            for record in &records {
                 println!("{}", record.path());
-                count += 1;
             }
-            eprintln!("{count} records");
+            eprintln!("{} records", records.len());
         }
 
         Command::Validate { collection } => {

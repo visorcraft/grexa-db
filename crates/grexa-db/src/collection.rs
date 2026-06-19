@@ -112,6 +112,29 @@ impl Collection {
         crate::query::Query::new(self)
     }
 
+    /// Read and parse a single record by its full on-disk path. Shared by the
+    /// streaming [`RecordIter`] and the parallel query path. The path must come
+    /// from this collection's own directory walk (no security canonicalization
+    /// here — that is [`Collection::record`]'s job for caller-supplied paths).
+    pub(crate) fn read_record_at(&self, full: &Path) -> Result<Record, RecordError> {
+        let relative = full
+            .strip_prefix(&self.root)
+            .unwrap_or(full)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let content = fs::read_to_string(full).map_err(|e| RecordError::ReadFile {
+            path: relative.clone(),
+            reason: e.to_string(),
+        })?;
+        Record::from_content(relative, &content)
+    }
+
+    /// All record file paths (full, directory-walk order). The parallel query
+    /// path reads these concurrently.
+    pub(crate) fn collect_paths_full(&self) -> Vec<PathBuf> {
+        collect_record_paths(&self.root)
+    }
+
     /// Canonical database root: the parent of the (canonical) collection
     /// directory. `ref<T>` values are DB-root-relative, so they resolve
     /// against this. Falls back to the collection root only in the
@@ -168,18 +191,9 @@ impl Iterator for RecordIter<'_> {
     type Item = Result<Record, RecordError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.paths.next().map(|full| {
-            let relative = full
-                .strip_prefix(&self.collection.root)
-                .unwrap_or(&full)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let content = fs::read_to_string(&full).map_err(|e| RecordError::ReadFile {
-                path: relative.clone(),
-                reason: e.to_string(),
-            })?;
-            Record::from_content(relative, &content)
-        })
+        self.paths
+            .next()
+            .map(|full| self.collection.read_record_at(&full))
     }
 }
 

@@ -41,7 +41,7 @@ use crate::record::RecordError;
 use serde_yaml::Value;
 use std::cmp::Ordering;
 use std::iter::FusedIterator;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A trait for Rust values that can be converted into a YAML [`Value`] for
 /// filter comparisons.
@@ -169,6 +169,10 @@ enum QueryState<'a> {
     Exhausted,
 }
 
+/// A run of matched records tagged with the chunk's start index in the path
+/// list, so worker results can be re-sorted back into directory-walk order.
+type WorkerChunks = Vec<(usize, Vec<Record>)>;
+
 impl<'a> Query<'a> {
     pub(crate) fn new(collection: &'a Collection) -> Self {
         Self {
@@ -205,45 +209,130 @@ impl<'a> Query<'a> {
     }
 
     fn init_state(&mut self) {
-        if let Some(order_by) = self.order_by.take() {
-            let mut records = Vec::new();
-            let mut pending_error = None;
-            for result in self.collection.records() {
-                match result {
-                    Ok(record) => {
-                        if self.filters.iter().all(|f| f.matches(&record)) {
-                            records.push(record);
-                        }
-                    }
-                    Err(e) => {
-                        pending_error = Some(e);
-                        break;
-                    }
-                }
-            }
-            match pending_error {
-                Some(e) => self.state = QueryState::Errored(Some(e)),
-                None => {
-                    records.sort_by(|a, b| {
-                        match (a.field(&order_by.field), b.field(&order_by.field)) {
-                            (Some(_), None) => Ordering::Less,
-                            (None, Some(_)) => Ordering::Greater,
-                            (Some(av), Some(bv)) => {
-                                let ord = cmp(av, bv).unwrap_or(Ordering::Equal);
-                                match order_by.direction {
-                                    SortDir::Asc => ord,
-                                    SortDir::Desc => ord.reverse(),
-                                }
-                            }
-                            (None, None) => Ordering::Equal,
-                        }
-                    });
-                    self.state = QueryState::Buffered(records.into_iter());
-                }
+        // `order_by` must materialize the whole result set anyway, so read +
+        // parse it in parallel. Filter-only queries stay lazy/streaming below
+        // (preserving O(1) memory and early-exit for `.next()` callers).
+        if self.order_by.is_some() {
+            match self.materialize_par() {
+                Ok(records) => self.state = QueryState::Buffered(records.into_iter()),
+                Err(e) => self.state = QueryState::Errored(Some(e)),
             }
         } else {
             self.state = QueryState::Streaming(self.collection.records());
         }
+    }
+
+    /// Drain the query into a `Vec`, reading and parsing records **in parallel**
+    /// across the available CPUs (serial fallback for small collections). The
+    /// result set and ordering are identical to draining the streaming
+    /// [`Iterator`]. Use this for "read everything" callers (CLI, batch jobs);
+    /// the `Iterator` impl stays lazy for early-exit / streaming callers.
+    pub fn collect_par(self) -> Result<Vec<Record>, RecordError> {
+        self.materialize_par()
+    }
+
+    fn materialize_par(&self) -> Result<Vec<Record>, RecordError> {
+        // Below this many records, thread setup costs more than it saves — and
+        // grexa-db's own dogfooded stores hold a handful of records.
+        const MIN_PER_WORKER: usize = 512;
+
+        let paths = self.collection.collect_paths_full();
+        let n = paths.len();
+        let cores = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1);
+        let workers = (n / MIN_PER_WORKER).clamp(1, cores);
+
+        let mut out = if workers <= 1 {
+            filter_paths(self.collection, &self.filters, &paths)?
+        } else {
+            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+            // Dynamic work-stealing: each worker pulls the next small chunk via
+            // a shared cursor, so uneven per-record cost (a big body, a slow
+            // read) can't leave a core idle the way a fixed even split would.
+            // Chunks are tagged with their start index and re-sorted at the end,
+            // so output order still matches the directory walk.
+            const STEAL_CHUNK: usize = 128;
+            let cursor = AtomicUsize::new(0);
+            let cursor = &cursor;
+            let filters = &self.filters;
+            let coll = self.collection;
+            let paths_ref: &[PathBuf] = &paths;
+            // Scoped threads borrow `coll`/`filters`/`paths` directly — no
+            // clones, no 'static bound, joined before the borrows end.
+            let worker_out: Vec<Result<WorkerChunks, RecordError>> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        s.spawn(move || {
+                            let mut local: WorkerChunks = Vec::new();
+                            loop {
+                                let start = cursor.fetch_add(STEAL_CHUNK, AtomicOrdering::Relaxed);
+                                if start >= n {
+                                    break;
+                                }
+                                let end = (start + STEAL_CHUNK).min(n);
+                                let recs = filter_paths(coll, filters, &paths_ref[start..end])?;
+                                local.push((start, recs));
+                            }
+                            Ok(local)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("record worker thread panicked"))
+                    .collect()
+            });
+            let mut chunks: WorkerChunks = Vec::new();
+            for w in worker_out {
+                chunks.extend(w?);
+            }
+            chunks.sort_by_key(|(start, _)| *start);
+            let mut merged = Vec::new();
+            for (_, recs) in chunks {
+                merged.extend(recs);
+            }
+            merged
+        };
+
+        if let Some(ob) = &self.order_by {
+            out.sort_by(|a, b| order_cmp(a, b, ob));
+        }
+        Ok(out)
+    }
+}
+
+/// Read + parse each path and keep the records matching every filter. Shared by
+/// the serial and per-worker paths so both apply identical predicate logic.
+fn filter_paths(
+    coll: &Collection,
+    filters: &[Filter],
+    paths: &[PathBuf],
+) -> Result<Vec<Record>, RecordError> {
+    let mut kept = Vec::new();
+    for p in paths {
+        let record = coll.read_record_at(p)?;
+        if filters.iter().all(|f| f.matches(&record)) {
+            kept.push(record);
+        }
+    }
+    Ok(kept)
+}
+
+/// The `order_by` comparator: records missing the sort field always sort last,
+/// regardless of direction (matches the streaming-sort semantics).
+fn order_cmp(a: &Record, b: &Record, ob: &OrderBy) -> Ordering {
+    match (a.field(&ob.field), b.field(&ob.field)) {
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(av), Some(bv)) => {
+            let ord = cmp(av, bv).unwrap_or(Ordering::Equal);
+            match ob.direction {
+                SortDir::Asc => ord,
+                SortDir::Desc => ord.reverse(),
+            }
+        }
+        (None, None) => Ordering::Equal,
     }
 }
 
@@ -740,5 +829,71 @@ mod tests {
         let mut query = coll.query().filter("rating").ge(4);
         let first = query.next().unwrap().unwrap();
         assert!(first.field("rating").unwrap().as_i64().unwrap() >= 4);
+    }
+
+    #[test]
+    fn collect_par_matches_serial_small() {
+        // Small collection takes the serial fallback inside materialize_par.
+        let dir = make_collection();
+        let coll = Collection::open(dir.path()).unwrap();
+        let serial: Vec<String> = paths(
+            coll.query()
+                .filter("rating")
+                .ge(4)
+                .collect::<Result<_, _>>()
+                .unwrap(),
+        );
+        let par: Vec<String> = paths(coll.query().filter("rating").ge(4).collect_par().unwrap());
+        assert_eq!(serial, par);
+    }
+
+    #[test]
+    fn collect_par_matches_serial_large() {
+        // > MIN_PER_WORKER records so the multi-threaded path actually runs;
+        // results (and order) must be byte-identical to the serial iterator.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("schema.md"), SCHEMA).unwrap();
+        for i in 0..3000 {
+            let rating = (i % 5) + 1;
+            fs::write(
+                dir.path().join(format!("n{i:05}.md")),
+                format!(
+                    "---\ntitle: N{i}\ntags: [t{}, db]\nrating: {rating}\nread_at: 2024-01-{:02}\n---\nbody {i}\n",
+                    i % 7,
+                    (i % 28) + 1
+                ),
+            )
+            .unwrap();
+        }
+        let coll = Collection::open(dir.path()).unwrap();
+
+        // filter-only
+        let serial: Vec<String> = paths(
+            coll.query()
+                .filter("rating")
+                .ge(4)
+                .collect::<Result<_, _>>()
+                .unwrap(),
+        );
+        let par: Vec<String> = paths(coll.query().filter("rating").ge(4).collect_par().unwrap());
+        assert_eq!(serial, par, "parallel filter must equal serial");
+        assert!(!par.is_empty());
+
+        // order_by (the path init_state now parallelizes)
+        let serial_sorted: Vec<String> = paths(
+            coll.query()
+                .order_by("read_at")
+                .desc()
+                .collect::<Result<_, _>>()
+                .unwrap(),
+        );
+        let par_sorted: Vec<String> = paths(
+            coll.query()
+                .order_by("read_at")
+                .desc()
+                .collect_par()
+                .unwrap(),
+        );
+        assert_eq!(serial_sorted, par_sorted, "parallel sort must equal serial");
     }
 }
