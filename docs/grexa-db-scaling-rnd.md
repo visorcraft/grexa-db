@@ -287,9 +287,12 @@ is where "records are files" actually costs you.
    (`Record::field_scalar`) so a filter touches only the fields it queries.
    **2.37×** on full parse, **5.5×** on single-field filters (isolated, 200k
    records). Guarded by a differential test that asserts the fast path equals
-   `serde` byte-for-byte and an 8k-iteration randomized fuzz — any input it
-   isn't certain about falls back to `serde`, so it can only ever be slower,
-   never wrong.
+   `serde` byte-for-byte, a key×value cartesian, and a randomized multi-line
+   fuzz checking two invariants — `field_scalar == field`, and `is_flat ⇒
+   serde accepts the head`. The fuzz caught real edge cases (flow-seq trailing/
+   interior commas, tab-then-`#` comments, `:`+tab and trailing `:` mapping
+   indicators, values leading with `]`/`}`); each now falls back to `serde`, so
+   the fast path can only ever be slower, never wrong.
 6. **Adaptive sharding (#3)** — only once the directory knee is actually hit
    (measured: not before ~1M, and only on real disk).
 

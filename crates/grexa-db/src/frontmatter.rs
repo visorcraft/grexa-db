@@ -190,6 +190,13 @@ fn parse_flow_seq(s: &str) -> Option<Value> {
     }
     let mut seq = Vec::new();
     for part in inner.split(',') {
+        // An empty element is the fiddly case: a *trailing* comma (`[a, b,]`)
+        // is allowed and adds no element, but a *middle* empty (`[a, , b]`) is
+        // a null. Rather than reproduce that distinction, hand any flow seq
+        // with an empty element to serde.
+        if part.trim().is_empty() {
+            return None;
+        }
         seq.push(resolve_scalar(part.trim())?);
     }
     Some(Value::Sequence(seq))
@@ -269,7 +276,14 @@ fn is_plain_string(s: &str) -> bool {
     if br#"[]{}&*!|>%@`"'#,?:-"#.contains(&first) {
         return false;
     }
-    if s.contains(" #") || s.contains(": ") {
+    // A plain scalar ends at a comment (a blank then `#`) or a mapping-value
+    // indicator (`:` then a blank, or a trailing `:`). "Blank" is space OR tab —
+    // serde honors both, so checking only the space form would mis-accept
+    // `foo\t# c` (serde: "foo") and `a:\tb` (serde: error).
+    if s.contains(" #") || s.contains("\t#") {
+        return false;
+    }
+    if s.contains(": ") || s.contains(":\t") || s.ends_with(':') {
         return false;
     }
     true
@@ -334,20 +348,27 @@ fn is_plain_string_key(key: &str) -> bool {
         )
 }
 
-/// True if `val` is a single-line scalar or simple `[a, b]` flow sequence with
-/// no YAML-special meaning — so the line can't hide structure (a nested
-/// mapping, a continued block/flow) that would make an "absent" answer wrong.
+/// True only if `val` is a single-line value serde is *certain* to accept — an
+/// empty (null), a serde-shaped number, a flow sequence whose elements all
+/// resolve to simple scalars, or a plain unquoted string. Anything else (a
+/// value serde might reject — a flow-context comment/alias, a nested/quoted
+/// element — or a continued block/flow that could hide structure) returns false
+/// so the head falls back to the eager serde parse, preserving its accept/reject
+/// behavior exactly. Each `true` branch is provably serde-valid, so `is_flat`
+/// never classifies a serde-invalid head as flat.
 fn value_self_contained(val: &str) -> bool {
     let v = val.trim();
     if v.is_empty() {
         return true;
     }
-    let first = v.as_bytes()[0];
-    match first {
-        b'[' => v.ends_with(']') && !v[1..v.len() - 1].contains(['[', '{', '"', '\'']),
-        b'{' | b'|' | b'>' | b'"' | b'\'' | b'&' | b'*' | b'!' | b'%' | b'@' | b'`' | b'#' => false,
-        _ => !v.contains(" #") && !v.contains(": "),
+    if v.starts_with('[') {
+        // Only a fully-resolvable flat seq counts: that proves every element is
+        // a simple serde-valid scalar (so the whole head is valid YAML). Exotic
+        // seqs (comments, aliases, nesting, maps, hex/float elements) resolve to
+        // None here and take the eager path, where serde decides correctly.
+        return parse_flow_seq(v).is_some();
     }
+    is_number_shaped(v) || is_plain_string(v)
 }
 
 /// True if `head` is flat (every line a simple `key: value`, plain keys, no
@@ -480,6 +501,12 @@ mod tests {
             "[1, a, 2024-01-01]",
             "[nested, [x]]",
             "[a, \"b\"]",
+            // trailing / middle / leading empties — serde's null rules differ
+            // from a naive split, so these must fall back (no element vs null).
+            "[a, b,]",
+            "[a,,b]",
+            "[,a]",
+            "[a, , b]",
             // must fall back: quotes, flow map, indicators, comments
             "\"quoted\"",
             "'single'",

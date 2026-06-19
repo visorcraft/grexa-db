@@ -373,9 +373,21 @@ mod tests {
             "2024-01-01",
             "[a, b]",
             "[]",
+            "[a, b,]",
+            "[a,,b]",
             "mid:colon",
             "v1.2.3",
             "yes",
+            // adversarial: serde-invalid / comment / mapping-indicator edges
+            "]",
+            "}",
+            "a:",
+            "foo\t# c",
+            "a:\tb",
+            "[a #c]",
+            "[*x]",
+            "a [b]",
+            "a, b",
         ];
         let mut state: u64 = 0x9e3779b97f4a7c15;
         let mut next = |n: usize| {
@@ -425,7 +437,8 @@ mod tests {
                 );
             }
             // (2) full parse == serde, exactly
-            let serde_v: Value = serde_yaml::from_str(&head).expect("flat head is valid YAML");
+            let serde_v: Value = serde_yaml::from_str(&head)
+                .unwrap_or_else(|e| panic!("is_flat accepted serde-invalid head {head:?}: {e}"));
             assert_eq!(
                 r.frontmatter(),
                 &serde_v,
