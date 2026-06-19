@@ -26,7 +26,7 @@ engine-owned log.**
 | # | Bottleneck | Status | Lever | Measured (shipped) |
 |---|---|---|---|---|
 | 2 | per-record I/O | **SHIPPED** | `std::thread` work-stealing parallel scan (no deps) | **2–5×** end-to-end (selective filter 4.8×) |
-| 4 | YAML parse cost | **prototyped, not shipped** | hand-rolled frontmatter fast-path | prototype ~2.9× (quality risk — held back) |
+| 4 | YAML parse cost | **SHIPPED** | hand-rolled flat-frontmatter fast-path + lazy single-field resolve | **2.37×** full parse, **5.5×** single-field filter (isolated); differential-tested == serde |
 | 1 | no index → O(n) scan | **SHIPPED** (held handle) | derived `.grexa-index/` sidecar + verify-on-read | **297×** selective, held in memory |
 | 5 | order_by buffers everything | **SHIPPED** | bounded top-K via `.limit()` | **O(k)** memory, not O(matches) |
 | 3 | large-directory degradation | **non-issue to 1M** | adaptive shard, on-disk only, past ~100k | linear to 1M; no knee |
@@ -278,12 +278,18 @@ is where "records are files" actually costs you.
    Wired into Grexa's Database browser with `inotify` (`4e43315` in the app repo).
 3. **Top-K `order_by` — ✅ SHIPPED** (`86f7c27`): `Query::limit(k)` fuses into a
    parallel bounded top-K, **O(k)** memory instead of buffering every match.
-4. **Index v2 — not yet:** ranges/`ne` (order-preserving keys), a binary format
-   (faster build/load), O(changes) reconcile, parallel candidate reads. Mostly
-   narrows the cases that still scan; medium value.
-5. **Frontmatter fast-path (#4) — not shipped:** ~2.9× on the cold scan, but a
-   hand-rolled YAML parser whose resolution must match `serde` exactly. Real
-   quality risk; only ship behind an exhaustive differential test.
+4. **Index v2 — ranges ✅ SHIPPED:** order-preserving keys (`INDEX_VERSION 2`)
+   give `lt/le/gt/ge` range candidates via `BTreeMap` scans. Still pending: a
+   binary format (faster build/load), O(changes) reconcile, parallel candidate
+   reads. Mostly narrows the cases that still scan; medium value.
+5. **Frontmatter fast-path (#4) — ✅ SHIPPED:** a hand-rolled parser for the
+   common flat `key: scalar | [array]` head, plus lazy single-field resolution
+   (`Record::field_scalar`) so a filter touches only the fields it queries.
+   **2.37×** on full parse, **5.5×** on single-field filters (isolated, 200k
+   records). Guarded by a differential test that asserts the fast path equals
+   `serde` byte-for-byte and an 8k-iteration randomized fuzz — any input it
+   isn't certain about falls back to `serde`, so it can only ever be slower,
+   never wrong.
 6. **Adaptive sharding (#3)** — only once the directory knee is actually hit
    (measured: not before ~1M, and only on real disk).
 

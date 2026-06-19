@@ -124,8 +124,10 @@ struct Filter {
 
 impl Filter {
     fn matches(&self, record: &Record) -> bool {
-        match record.field(&self.field) {
-            Some(v) => self.op.matches(v),
+        // `field_scalar` resolves only this field from a flat head — no need to
+        // build the whole frontmatter `Value` just to test one predicate.
+        match record.field_scalar(&self.field) {
+            Some(v) => self.op.matches(&v),
             None => false,
         }
     }
