@@ -163,6 +163,10 @@ pub struct Query<'a> {
     /// full scan. The index is never auto-loaded per query (that was slower than
     /// scanning); a persistent caller loads it once and reuses it here.
     index: Option<&'a Index>,
+    /// Cap the result at this many records. With `order_by` it fuses into a
+    /// bounded top-K heap (O(n log k) time, O(k) memory); without, it stops the
+    /// scan/stream after k matches.
+    limit: Option<usize>,
     state: QueryState<'a>,
 }
 
@@ -185,8 +189,17 @@ impl<'a> Query<'a> {
             filters: Vec::new(),
             order_by: None,
             index: None,
+            limit: None,
             state: QueryState::NotStarted,
         }
+    }
+
+    /// Cap the result at `k` records. With `order_by` this fuses into a bounded
+    /// top-K heap: O(n log k) time and **O(k)** memory instead of buffering and
+    /// sorting every match. Without `order_by`, it just stops after k matches.
+    pub fn limit(mut self, k: usize) -> Query<'a> {
+        self.limit = Some(k);
+        self
     }
 
     /// Use a caller-held, in-memory [`Index`] to accelerate this query: selective
@@ -257,6 +270,12 @@ impl<'a> Query<'a> {
             return Ok(out);
         }
 
+        // `order_by` + `limit` fuses into a bounded top-K: workers keep only
+        // their k best, so memory is O(k) instead of buffering every match.
+        if let (Some(ob), Some(k)) = (&self.order_by, self.limit) {
+            return self.topk_par(ob, k);
+        }
+
         // Below this many records, thread setup costs more than it saves — and
         // grexa-db's own dogfooded stores hold a handful of records.
         const MIN_PER_WORKER: usize = 512;
@@ -323,7 +342,77 @@ impl<'a> Query<'a> {
         if let Some(ob) = &self.order_by {
             out.sort_by(|a, b| order_cmp(a, b, ob));
         }
+        if let Some(k) = self.limit {
+            out.truncate(k);
+        }
         Ok(out)
+    }
+
+    /// Parallel bounded top-K for `order_by` + `limit`. Each worker keeps only
+    /// its k best (trimming at 2k), so per-worker memory is O(k); merging the
+    /// workers' top-k and trimming again yields the global top-k — identical to
+    /// a full sort then truncate, but without ever holding every match.
+    fn topk_par(&self, ob: &OrderBy, k: usize) -> Result<Vec<Record>, RecordError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let paths = self.collection.collect_paths_full();
+        let n = paths.len();
+        const MIN_PER_WORKER: usize = 512;
+        let cores = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1);
+        let workers = (n / MIN_PER_WORKER).clamp(1, cores);
+
+        let mut merged = if workers <= 1 {
+            worker_topk(self.collection, &self.filters, ob, k, &paths)?
+        } else {
+            use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+            const STEAL_CHUNK: usize = 128;
+            let cursor = AtomicUsize::new(0);
+            let cursor = &cursor;
+            let filters = &self.filters;
+            let coll = self.collection;
+            let paths_ref: &[PathBuf] = &paths;
+            let outs: Vec<Result<Vec<Record>, RecordError>> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        s.spawn(move || {
+                            let mut buf: Vec<Record> = Vec::new();
+                            loop {
+                                let start = cursor.fetch_add(STEAL_CHUNK, AtomicOrdering::Relaxed);
+                                if start >= n {
+                                    break;
+                                }
+                                let end = (start + STEAL_CHUNK).min(n);
+                                for p in &paths_ref[start..end] {
+                                    let rec = coll.read_record_at(p)?;
+                                    if filters.iter().all(|f| f.matches(&rec)) {
+                                        buf.push(rec);
+                                        if buf.len() >= 2 * k {
+                                            topk_trim(&mut buf, ob, k);
+                                        }
+                                    }
+                                }
+                            }
+                            topk_trim(&mut buf, ob, k);
+                            Ok(buf)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("topk worker thread panicked"))
+                    .collect()
+            });
+            let mut global = Vec::new();
+            for r in outs {
+                global.extend(r?);
+            }
+            global
+        };
+        topk_trim(&mut merged, ob, k);
+        Ok(merged)
     }
 
     /// Answer the query from the caller-held index, if one is attached and at
@@ -369,6 +458,9 @@ impl<'a> Query<'a> {
                 out.sort_by(|a, b| order_cmp(a, b, ob).then_with(|| a.path().cmp(b.path())))
             }
             None => out.sort_by(|a, b| a.path().cmp(b.path())),
+        }
+        if let Some(k) = self.limit {
+            out.truncate(k);
         }
         Ok(Some(out))
     }
@@ -431,6 +523,34 @@ fn filter_paths(
     Ok(kept)
 }
 
+/// Sort by the order key (ties broken by path) and keep only the first k.
+fn topk_trim(buf: &mut Vec<Record>, ob: &OrderBy, k: usize) {
+    buf.sort_by(|a, b| order_cmp(a, b, ob).then_with(|| a.path().cmp(b.path())));
+    buf.truncate(k);
+}
+
+/// Read + filter a path slice, keeping only the k best by `ob` (bounded memory).
+fn worker_topk(
+    coll: &Collection,
+    filters: &[Filter],
+    ob: &OrderBy,
+    k: usize,
+    paths: &[PathBuf],
+) -> Result<Vec<Record>, RecordError> {
+    let mut buf = Vec::new();
+    for p in paths {
+        let record = coll.read_record_at(p)?;
+        if filters.iter().all(|f| f.matches(&record)) {
+            buf.push(record);
+            if buf.len() >= 2 * k {
+                topk_trim(&mut buf, ob, k);
+            }
+        }
+    }
+    topk_trim(&mut buf, ob, k);
+    Ok(buf)
+}
+
 /// The `order_by` comparator: records missing the sort field always sort last,
 /// regardless of direction (matches the streaming-sort semantics).
 fn order_cmp(a: &Record, b: &Record, ob: &OrderBy) -> Ordering {
@@ -455,6 +575,12 @@ impl<'a> Iterator for Query<'a> {
         if matches!(self.state, QueryState::NotStarted) {
             self.init_state();
         }
+        // Streaming filter-only `limit`: stop after k matches. (order_by/index
+        // paths are already truncated in `materialize_par`/`try_index`.)
+        if self.limit == Some(0) {
+            self.state = QueryState::Exhausted;
+            return None;
+        }
 
         let filters = &self.filters;
         match &mut self.state {
@@ -462,6 +588,9 @@ impl<'a> Iterator for Query<'a> {
                 match source.next()? {
                     Ok(record) => {
                         if filters.iter().all(|f| f.matches(&record)) {
+                            if let Some(rem) = self.limit.as_mut() {
+                                *rem -= 1;
+                            }
                             return Some(Ok(record));
                         }
                     }
@@ -1190,5 +1319,94 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(fives, vec!["b.md".to_string()], "deleted candidate not tolerated");
+    }
+
+    #[test]
+    fn limit_topk_matches_full_sort() {
+        let dir = rand_collection(800);
+        let coll = Collection::open(dir.path()).unwrap();
+        // Bounded top-K must equal a full sort then truncate, for every k —
+        // including ties (read_at/rating repeat heavily across 800 records).
+        for field in ["rating", "read_at"] {
+            let full = paths(coll.query().order_by(field).desc().collect_par().unwrap());
+            for k in [0usize, 1, 5, 20, 100, 800, 1000] {
+                let topk = paths(
+                    coll.query()
+                        .order_by(field)
+                        .desc()
+                        .limit(k)
+                        .collect_par()
+                        .unwrap(),
+                );
+                let want: Vec<String> = full.iter().take(k).cloned().collect();
+                assert_eq!(topk, want, "top-{k} by {field} != full sort truncated");
+            }
+        }
+        // filter + order_by + limit
+        let full = paths(
+            coll.query()
+                .filter("tags")
+                .contains("rust")
+                .order_by("read_at")
+                .asc()
+                .collect_par()
+                .unwrap(),
+        );
+        let top = paths(
+            coll.query()
+                .filter("tags")
+                .contains("rust")
+                .order_by("read_at")
+                .asc()
+                .limit(10)
+                .collect_par()
+                .unwrap(),
+        );
+        assert_eq!(top, full.into_iter().take(10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn limit_filter_only_stops_early() {
+        let dir = rand_collection(800);
+        let coll = Collection::open(dir.path()).unwrap();
+        // Streaming iterator and collect_par both honor the limit, identically.
+        let streamed = paths(
+            coll.query()
+                .filter("rating")
+                .ge(1)
+                .limit(7)
+                .collect::<Result<_, _>>()
+                .unwrap(),
+        );
+        let par = paths(
+            coll.query()
+                .filter("rating")
+                .ge(1)
+                .limit(7)
+                .collect_par()
+                .unwrap(),
+        );
+        assert_eq!(streamed.len(), 7);
+        assert_eq!(streamed, par);
+        // limit(0) yields nothing on either path.
+        assert!(
+            coll.query()
+                .filter("rating")
+                .ge(1)
+                .limit(0)
+                .collect_par()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            coll.query()
+                .filter("rating")
+                .ge(1)
+                .limit(0)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 }
