@@ -34,7 +34,7 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 use thiserror::Error;
 
-const INDEX_VERSION: u64 = 1;
+const INDEX_VERSION: u64 = 2;
 const INDEX_DIR: &str = ".grexa-index";
 const INDEX_FILE: &str = "index.json";
 
@@ -62,32 +62,44 @@ fn stat_sig(path: &Path) -> Option<Sig> {
     Some((mtime, md.len()))
 }
 
-/// A canonical string key for a value, collapsing exactly the equivalence
-/// classes that `query.rs`'s `values_equal` treats as equal — so the index can
-/// never split two scan-equal values into different buckets (which would be a
-/// false negative). Type-prefixed so a number and a same-looking string never
-/// collide (a collision would only ever cause a false *positive*, which
-/// verify-on-read drops). Returns `None` for values that aren't indexed
-/// (null / nested mappings).
+/// A canonical, **order-preserving** string key for a value: comparing two keys
+/// of the same type byte-wise reproduces the scan's `cmp` ordering, so a
+/// `BTreeMap` range scan over the keys answers `lt/le/gt/ge`. It also collapses
+/// exactly the equivalence classes `values_equal` treats as equal (e.g. 4 and
+/// 4.0 → the same key), so the index never splits scan-equal values (a false
+/// negative). Type-prefixed (`n`/`s`/`b`) so cross-type keys never interleave;
+/// a collision can only ever be a false *positive*, which verify-on-read drops.
+/// Returns `None` for unindexable values (null / nested mappings).
 pub(crate) fn index_key(v: &Value) -> Option<String> {
-    // Numbers: i64 and the equal f64 (e.g. 4 and 4.0) must share a key, because
-    // `values_equal` compares them via the f64 path and considers them equal.
-    if let Some(i) = v.as_i64() {
-        return Some(format!("i{i}"));
-    }
-    if let Some(f) = v.as_f64() {
-        if f.is_finite() && f == f.trunc() && f.abs() < 9.0e18 {
-            return Some(format!("i{}", f as i64));
-        }
-        return Some(format!("f{}", f.to_bits()));
+    // Numbers (i64 and f64 unified through f64, matching `values_equal`): encode
+    // as the IEEE total-order transform of the bits, hex zero-padded, so byte
+    // order == numeric order. `4` and `4.0` collapse to the same key.
+    if let Some(f) = crate::query::as_f64(v) {
+        let bits = f.to_bits();
+        let ordered = if bits & (1 << 63) == 0 {
+            bits | (1 << 63)
+        } else {
+            !bits
+        };
+        return Some(format!("n{ordered:016x}"));
     }
     if let Some(b) = v.as_bool() {
-        return Some(format!("b{b}"));
+        return Some(format!("b{}", b as u8));
     }
+    // Strings sort lexicographically already — the raw bytes after the prefix
+    // reproduce `str::cmp`, so string range queries (e.g. ISO dates) work too.
     if let Some(s) = v.as_str() {
         return Some(format!("s{s}"));
     }
     None
+}
+
+/// The `[lo, hi)` key range covering exactly the keys that share `key`'s type
+/// prefix byte — used to bound range scans to one type (cross-type `cmp` is
+/// undefined, so other-typed keys must not be returned as range candidates).
+pub(crate) fn key_prefix_bounds(key: &str) -> (String, String) {
+    let first = key.as_bytes()[0]; // ascii 'b' / 'n' / 's'
+    ((first as char).to_string(), ((first + 1) as char).to_string())
 }
 
 /// field name -> value key -> list of record relative paths.
@@ -243,6 +255,25 @@ impl Index {
     /// The posting list (sorted relative paths) for `field == key`, if any.
     pub(crate) fn posting(&self, field: &str, key: &str) -> Option<&Vec<String>> {
         self.fields.get(field)?.get(key)
+    }
+
+    /// Union of posting lists for every indexed key of `field` within the key
+    /// range `[lower, upper)` (order-preserving keys → numeric/lexicographic
+    /// ranges). Used for `lt/le/gt/ge`.
+    pub(crate) fn range_postings(
+        &self,
+        field: &str,
+        lower: std::ops::Bound<String>,
+        upper: std::ops::Bound<String>,
+    ) -> Vec<String> {
+        let Some(buckets) = self.fields.get(field) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for paths in buckets.range((lower, upper)).map(|(_, v)| v) {
+            out.extend(paths.iter().cloned());
+        }
+        out
     }
 }
 

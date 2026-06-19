@@ -36,12 +36,13 @@
 //! ```
 
 use crate::collection::Collection;
-use crate::index::{Index, index_key};
+use crate::index::{Index, index_key, key_prefix_bounds};
 use crate::record::Record;
 use crate::record::RecordError;
 use serde_yaml::Value;
 use std::cmp::Ordering;
 use std::iter::FusedIterator;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 /// A trait for Rust values that can be converted into a YAML [`Value`] for
@@ -473,17 +474,29 @@ impl<'a> Query<'a> {
 fn plan_candidates(index: &Index, filters: &[Filter]) -> Option<Vec<String>> {
     let mut sets: Vec<Vec<String>> = Vec::new();
     for f in filters {
-        let value = match &f.op {
-            FilterOp::Eq(v) | FilterOp::Contains(v) => v,
-            _ => continue, // ranges / ne / contains_any|all → residual, applied at verify
-        };
         if !index.has_field(&f.field) {
             continue;
         }
-        let Some(key) = index_key(value) else {
-            continue;
+        let set = match &f.op {
+            FilterOp::Eq(v) | FilterOp::Contains(v) => {
+                let Some(key) = index_key(v) else { continue };
+                index.posting(&f.field, &key).cloned().unwrap_or_default()
+            }
+            FilterOp::Ge(v) | FilterOp::Gt(v) | FilterOp::Le(v) | FilterOp::Lt(v) => {
+                let Some(key) = index_key(v) else { continue };
+                let (lo, hi) = key_prefix_bounds(&key);
+                let (lower, upper) = match &f.op {
+                    FilterOp::Ge(_) => (Bound::Included(key), Bound::Excluded(hi)),
+                    FilterOp::Gt(_) => (Bound::Excluded(key), Bound::Excluded(hi)),
+                    FilterOp::Le(_) => (Bound::Included(lo), Bound::Included(key)),
+                    FilterOp::Lt(_) => (Bound::Included(lo), Bound::Excluded(key)),
+                    _ => unreachable!(),
+                };
+                index.range_postings(&f.field, lower, upper)
+            }
+            _ => continue, // ne / contains_any|all → residual, applied at verify
         };
-        sets.push(index.posting(&f.field, &key).cloned().unwrap_or_default());
+        sets.push(set);
     }
     if sets.is_empty() {
         return None;
@@ -1408,5 +1421,38 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn index_ranges_match_scan() {
+        // Range queries (lt/le/gt/ge), on numeric and string fields, alone and
+        // intersected with eq/contains/order_by, must match a scan exactly.
+        type BuildQ = Box<dyn for<'a> Fn(Query<'a>) -> Query<'a>>;
+        let dir = rand_collection(800);
+        let coll = Collection::open(dir.path()).unwrap();
+        let idx = Index::build(&coll).unwrap();
+        let cases: Vec<BuildQ> = vec![
+            Box::new(|q| q.filter("rating").ge(4)),
+            Box::new(|q| q.filter("rating").gt(2)),
+            Box::new(|q| q.filter("rating").le(2)),
+            Box::new(|q| q.filter("rating").lt(3)),
+            Box::new(|q| q.filter("read_at").ge("2024-02-20")), // string range
+            Box::new(|q| q.filter("read_at").lt("2024-02-02")), // selective → index read
+            Box::new(|q| q.filter("rating").ge(4).filter("tags").contains("rust")), // range ∩ contains
+            Box::new(|q| {
+                q.filter("read_at")
+                    .lt("2024-02-02")
+                    .order_by("rating")
+                    .desc()
+            }), // range + order
+        ];
+        let mut any = false;
+        for (i, bq) in cases.iter().enumerate() {
+            let scan = paths(bq(coll.query()).collect_par().unwrap());
+            let indexed = paths(bq(coll.query()).using_index(&idx).collect_par().unwrap());
+            assert_eq!(scan, indexed, "range case {i}: index != scan");
+            any |= !scan.is_empty();
+        }
+        assert!(any);
     }
 }
