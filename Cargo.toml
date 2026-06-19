@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 VisorCraft LLC
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+members = ["crates/grexa-db", "crates/grexa-db-cli"]
+resolver = "3"
+
+[workspace.package]
+version = "1.7.0"
+edition = "2024"
+repository = "https://github.com/visorcraft/grexa-db"
+
+# Dependency versions are pinned here and inherited by the member crates via
+# `<dep>.workspace = true`. Lifted verbatim from the Grexa monorepo workspace
+# this crate was extracted from.
+[workspace.dependencies]
+serde_json = "1.0"
+serde_yaml = { version = "0.10", package = "serde_yaml_ng" }
+thiserror = "2.0"
+tempfile = "3.27"
+clap = { version = "4.6", features = ["derive"] }

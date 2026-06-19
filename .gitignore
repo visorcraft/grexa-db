@@ -1,0 +1,17 @@
+/target/
+**/*.rs.bk
+**/*.orig
+*.log
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+.zed/
+**/*.swp
+**/*~
+
+# AI agent instruction files (kept local, not committed)
+/AGENTS.md
+/CLAUDE.md
+/GEMINI.md
