@@ -36,6 +36,7 @@
 //! ```
 
 use crate::collection::Collection;
+use crate::index::{Index, index_key};
 use crate::record::Record;
 use crate::record::RecordError;
 use serde_yaml::Value;
@@ -158,6 +159,10 @@ pub struct Query<'a> {
     collection: &'a Collection,
     filters: Vec<Filter>,
     order_by: Option<OrderBy>,
+    /// A caller-held, in-memory index to accelerate this query. `None` means a
+    /// full scan. The index is never auto-loaded per query (that was slower than
+    /// scanning); a persistent caller loads it once and reuses it here.
+    index: Option<&'a Index>,
     state: QueryState<'a>,
 }
 
@@ -179,8 +184,21 @@ impl<'a> Query<'a> {
             collection,
             filters: Vec::new(),
             order_by: None,
+            index: None,
             state: QueryState::NotStarted,
         }
+    }
+
+    /// Use a caller-held, in-memory [`Index`] to accelerate this query: selective
+    /// `eq` / `contains` filters read only the matching records instead of
+    /// scanning the whole collection. The caller is responsible for keeping the
+    /// index current (via [`Index::reconcile`] when records change); every
+    /// candidate is still re-read and re-checked against all filters
+    /// (verify-on-read), so a stale index can never yield a wrong-valued match —
+    /// at worst it misses a record the caller hasn't reconciled yet.
+    pub fn using_index(mut self, index: &'a Index) -> Query<'a> {
+        self.index = Some(index);
+        self
     }
 
     /// Begin a filter clause on `field`. Returns a [`FilterBuilder`] whose
@@ -232,6 +250,13 @@ impl<'a> Query<'a> {
     }
 
     fn materialize_par(&self) -> Result<Vec<Record>, RecordError> {
+        // A caller-held index can answer selective eq/contains queries by reading
+        // only the matching records, not the whole tree. Only used when the
+        // caller explicitly attached one (see `using_index`); never auto-loaded.
+        if let Some(out) = self.try_index()? {
+            return Ok(out);
+        }
+
         // Below this many records, thread setup costs more than it saves — and
         // grexa-db's own dogfooded stores hold a handful of records.
         const MIN_PER_WORKER: usize = 512;
@@ -300,6 +325,93 @@ impl<'a> Query<'a> {
         }
         Ok(out)
     }
+
+    /// Answer the query from the caller-held index, if one is attached and at
+    /// least one filter is index-serviceable. Returns `Ok(None)` so the caller
+    /// scans otherwise. Candidate paths from the index are re-read and
+    /// re-checked against *every* filter (verify-on-read) — so a candidate whose
+    /// content changed, or that was deleted, can never produce a wrong match —
+    /// then ordered exactly as the scan path orders them.
+    fn try_index(&self) -> Result<Option<Vec<Record>>, RecordError> {
+        let Some(index) = self.index else {
+            return Ok(None);
+        };
+        let Some(rels) = plan_candidates(index, &self.filters) else {
+            return Ok(None);
+        };
+        // Selectivity guard: candidates are read one-by-one here, while a scan
+        // reads in parallel across all cores. Past roughly 1/16 of the
+        // collection, the parallel scan wins — so hand low-selectivity queries
+        // back to it rather than risk a slowdown. (The index's whole point is
+        // the highly-selective case, where this never triggers.)
+        if rels.len().saturating_mul(16) > index.record_count() {
+            return Ok(None);
+        }
+        let root = self.collection.root();
+        let mut out = Vec::new();
+        for rel in &rels {
+            // Tolerate a candidate that has since been deleted (a change the
+            // caller hasn't reconciled): it simply no longer matches.
+            let record = match self.collection.read_record_at(&root.join(rel)) {
+                Ok(r) => r,
+                Err(RecordError::ReadFile { .. }) => continue,
+                Err(e) => return Err(e),
+            };
+            if self.filters.iter().all(|f| f.matches(&record)) {
+                out.push(record);
+            }
+        }
+        // The scan path emits filter-only results in path order, and order_by
+        // results with ties broken by path (sorted input + stable sort); match
+        // both so index and scan are byte-identical.
+        match &self.order_by {
+            Some(ob) => {
+                out.sort_by(|a, b| order_cmp(a, b, ob).then_with(|| a.path().cmp(b.path())))
+            }
+            None => out.sort_by(|a, b| a.path().cmp(b.path())),
+        }
+        Ok(Some(out))
+    }
+}
+
+/// Build a candidate path set from the index for the `eq` / `contains` filters
+/// (the v1 index-serviceable ops). Returns `None` when no filter is serviceable,
+/// so the caller scans. The set is a superset of the true matches; verify-on-read
+/// makes the final result exact regardless.
+fn plan_candidates(index: &Index, filters: &[Filter]) -> Option<Vec<String>> {
+    let mut sets: Vec<Vec<String>> = Vec::new();
+    for f in filters {
+        let value = match &f.op {
+            FilterOp::Eq(v) | FilterOp::Contains(v) => v,
+            _ => continue, // ranges / ne / contains_any|all → residual, applied at verify
+        };
+        if !index.has_field(&f.field) {
+            continue;
+        }
+        let Some(key) = index_key(value) else {
+            continue;
+        };
+        sets.push(index.posting(&f.field, &key).cloned().unwrap_or_default());
+    }
+    if sets.is_empty() {
+        return None;
+    }
+    // AND the serviceable filters: intersect posting lists, smallest first.
+    sets.sort_by_key(|s| s.len());
+    let mut iter = sets.into_iter();
+    let mut acc = iter.next().unwrap();
+    for s in iter {
+        let keep: std::collections::HashSet<&str> = s.iter().map(String::as_str).collect();
+        acc.retain(|p| keep.contains(p.as_str()));
+        if acc.is_empty() {
+            break;
+        }
+    }
+    // Postings may carry a path more than once (e.g. a record listing a tag
+    // twice); dedup so verify-on-read never reads — and emits — it twice.
+    acc.sort();
+    acc.dedup();
+    Some(acc)
 }
 
 /// Read + parse each path and keep the records matching every filter. Shared by
@@ -895,5 +1007,188 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(serial_sorted, par_sorted, "parallel sort must equal serial");
+    }
+
+    fn mix(x: u64) -> u64 {
+        let mut z = x.wrapping_add(0x9e3779b97f4a7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+
+    fn rand_collection(n: usize) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("schema.md"), SCHEMA).unwrap();
+        let tags = ["rust", "ai", "ml", "db", "linux", "qt"];
+        for i in 0..n {
+            let h = |s: u64| mix(((i as u64) << 8) | s) as usize;
+            let rating = h(0) % 5 + 1;
+            let mut chosen: Vec<&str> = (0..(h(1) % 3 + 1))
+                .map(|k| tags[h(10 + k as u64) % tags.len()])
+                .collect();
+            chosen.sort();
+            chosen.dedup();
+            let day = h(2) % 28 + 1;
+            fs::write(
+                dir.path().join(format!("r{i:04}.md")),
+                format!(
+                    "---\ntitle: R{i}\ntags: [{}]\nrating: {rating}\nread_at: 2024-02-{day:02}\n---\nbody {i}\n",
+                    chosen.join(", ")
+                ),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn index_matches_scan() {
+        // Each builder is run as a plain scan and via a held index; the two must
+        // be byte-identical, including order, across serviceable and
+        // non-serviceable filter shapes.
+        type BuildQ = Box<dyn for<'a> Fn(Query<'a>) -> Query<'a>>;
+        let dir = rand_collection(800);
+        let coll = Collection::open(dir.path()).unwrap();
+        let idx = Index::build(&coll).unwrap();
+        let cases: Vec<BuildQ> = vec![
+            Box::new(|q| q.filter("rating").eq(5)),
+            Box::new(|q| q.filter("rating").eq(1)),
+            Box::new(|q| q.filter("tags").contains("rust")),
+            Box::new(|q| q.filter("tags").contains("qt")),
+            Box::new(|q| q.filter("rating").eq(4).filter("tags").contains("db")),
+            Box::new(|q| q.filter("read_at").eq("2024-02-15")),
+            Box::new(|q| q.filter("tags").contains("ai").order_by("rating").desc()),
+            Box::new(|q| q.filter("rating").eq(3).order_by("read_at").asc()),
+            // Not index-serviceable (range / ne / none): scanned either way.
+            Box::new(|q| q.filter("rating").ge(4)),
+            Box::new(|q| q.filter("rating").ne(5)),
+            Box::new(|q| q),
+        ];
+        let mut any = false;
+        for (i, bq) in cases.iter().enumerate() {
+            let scan = paths(bq(coll.query()).collect_par().unwrap());
+            let indexed = paths(bq(coll.query()).using_index(&idx).collect_par().unwrap());
+            assert_eq!(scan, indexed, "case {i}: index differs from scan");
+            any |= !scan.is_empty();
+        }
+        assert!(any, "no case matched anything");
+    }
+
+    #[test]
+    fn reconcile_reflects_modified() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("schema.md"), SCHEMA).unwrap();
+        fs::write(dir.path().join("a.md"), "---\nrating: 3\n---\nbody\n").unwrap();
+        fs::write(dir.path().join("b.md"), "---\nrating: 5\n---\nbody\n").unwrap();
+        let coll = Collection::open(dir.path()).unwrap();
+        let mut idx = Index::build(&coll).unwrap();
+        assert_eq!(
+            paths(
+                coll.query()
+                    .filter("rating")
+                    .eq(5)
+                    .using_index(&idx)
+                    .collect_par()
+                    .unwrap()
+            ),
+            vec!["b.md".to_string()]
+        );
+
+        fs::write(dir.path().join("a.md"), "---\nrating: 5\n---\nbody\n").unwrap();
+        idx.reconcile(&coll, &["a.md".to_string()]).unwrap();
+
+        let mut fives = paths(
+            coll.query()
+                .filter("rating")
+                .eq(5)
+                .using_index(&idx)
+                .collect_par()
+                .unwrap(),
+        );
+        fives.sort();
+        assert_eq!(fives, vec!["a.md".to_string(), "b.md".to_string()]);
+        assert!(
+            paths(
+                coll.query()
+                    .filter("rating")
+                    .eq(3)
+                    .using_index(&idx)
+                    .collect_par()
+                    .unwrap()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn reconcile_reflects_added_and_removed() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("schema.md"), SCHEMA).unwrap();
+        fs::write(dir.path().join("a.md"), "---\nrating: 5\n---\nbody\n").unwrap();
+        fs::write(dir.path().join("b.md"), "---\nrating: 5\n---\nbody\n").unwrap();
+        let coll = Collection::open(dir.path()).unwrap();
+        let mut idx = Index::build(&coll).unwrap();
+
+        fs::write(dir.path().join("c.md"), "---\nrating: 5\n---\nbody\n").unwrap();
+        fs::remove_file(dir.path().join("a.md")).unwrap();
+        idx.reconcile(&coll, &["c.md".to_string(), "a.md".to_string()])
+            .unwrap();
+
+        let mut fives = paths(
+            coll.query()
+                .filter("rating")
+                .eq(5)
+                .using_index(&idx)
+                .collect_par()
+                .unwrap(),
+        );
+        fives.sort();
+        assert_eq!(fives, vec!["b.md".to_string(), "c.md".to_string()]);
+    }
+
+    #[test]
+    fn stale_index_verify_on_read_drops_false_positive() {
+        // Without a reconcile, a record edited to no longer match is still in the
+        // stale index — but verify-on-read re-reads it and drops it. (A record
+        // edited to *newly* match would be missed until reconcile; that's the
+        // documented caller-owns-freshness contract.)
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("schema.md"), SCHEMA).unwrap();
+        fs::write(dir.path().join("a.md"), "---\nrating: 5\n---\nbody\n").unwrap();
+        fs::write(dir.path().join("b.md"), "---\nrating: 5\n---\nbody\n").unwrap();
+        let coll = Collection::open(dir.path()).unwrap();
+        let idx = Index::build(&coll).unwrap();
+
+        fs::write(dir.path().join("a.md"), "---\nrating: 1\n---\nbody\n").unwrap(); // no reconcile
+        let fives = paths(
+            coll.query()
+                .filter("rating")
+                .eq(5)
+                .using_index(&idx)
+                .collect_par()
+                .unwrap(),
+        );
+        assert_eq!(fives, vec!["b.md".to_string()], "stale false positive not dropped");
+    }
+
+    #[test]
+    fn stale_deleted_candidate_is_tolerated() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("schema.md"), SCHEMA).unwrap();
+        fs::write(dir.path().join("a.md"), "---\nrating: 5\n---\nbody\n").unwrap();
+        fs::write(dir.path().join("b.md"), "---\nrating: 5\n---\nbody\n").unwrap();
+        let coll = Collection::open(dir.path()).unwrap();
+        let idx = Index::build(&coll).unwrap();
+
+        fs::remove_file(dir.path().join("a.md")).unwrap(); // candidate vanishes, no reconcile
+        let fives = paths(
+            coll.query()
+                .filter("rating")
+                .eq(5)
+                .using_index(&idx)
+                .collect_par()
+                .unwrap(),
+        );
+        assert_eq!(fives, vec!["b.md".to_string()], "deleted candidate not tolerated");
     }
 }

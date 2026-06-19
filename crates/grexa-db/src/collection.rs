@@ -112,6 +112,23 @@ impl Collection {
         crate::query::Query::new(self)
     }
 
+    /// Build (or rebuild) the secondary index for this collection and publish it
+    /// to `.grexa-index/`. Returns the number of records indexed. The index is a
+    /// derived cache — queries use it only when it is provably current, and fall
+    /// back to a scan otherwise (see [`crate::index`]).
+    pub fn build_index(&self) -> Result<usize, crate::index::IndexError> {
+        let index = crate::index::Index::build(self)?;
+        index.save(&self.root)?;
+        Ok(index.record_count())
+    }
+
+    /// Load this collection's persisted index into an in-memory handle, or
+    /// `None` if it hasn't been built. Hold the handle and pass it to
+    /// [`crate::query::Query::using_index`] to accelerate selective queries.
+    pub fn load_index(&self) -> Option<crate::index::Index> {
+        crate::index::Index::load(&self.root)
+    }
+
     /// Read and parse a single record by its full on-disk path. Shared by the
     /// streaming [`RecordIter`] and the parallel query path. The path must come
     /// from this collection's own directory walk (no security canonicalization

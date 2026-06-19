@@ -62,6 +62,12 @@ impl Record {
         self.frontmatter.get(name)
     }
 
+    /// The whole parsed frontmatter value (a mapping, or `Null` if none). Used
+    /// by the secondary index to enumerate every field.
+    pub(crate) fn frontmatter(&self) -> &Value {
+        &self.frontmatter
+    }
+
     /// Serialize the entire frontmatter to a JSON string.
     pub fn frontmatter_json(&self) -> String {
         serde_json::to_string(&self.frontmatter).unwrap_or_else(|_| "{}".into())

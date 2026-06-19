@@ -55,6 +55,10 @@ enum Command {
         #[arg(long)]
         group_by: Option<String>,
     },
+    /// Build (or rebuild) the secondary index for a collection so selective
+    /// `eq` / `contains` queries skip the full scan. The index is a derived
+    /// cache under `.grexa-index/`; delete it any time and queries still work.
+    Index { collection: String },
 }
 
 fn main() -> ExitCode {
@@ -160,6 +164,12 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             db.materialize_view(view_name, coll.query(), group_by.as_deref())?;
             let view_path = db.root().join("views").join(view_name);
             println!("{}", view_path.display());
+        }
+
+        Command::Index { collection } => {
+            let coll = db.collection(collection)?;
+            let n = coll.build_index()?;
+            eprintln!("indexed {n} records in `{collection}`");
         }
     }
 
