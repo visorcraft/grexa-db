@@ -20,7 +20,7 @@ is a client without knowing the database exists.
 
 ```toml
 # Git dependency, pinned to a tag:
-grexa-db = { git = "https://github.com/visorcraft/grexa-db", tag = "v1.7.0" }
+grexa-db = { git = "https://github.com/visorcraft/grexa-db", tag = "v1.9.1" }
 ```
 
 ## Docs
@@ -30,6 +30,8 @@ grexa-db = { git = "https://github.com/visorcraft/grexa-db", tag = "v1.7.0" }
   concurrency model, reference-path safety.
 - [`docs/grexa-db-implementation-plan.md`](docs/grexa-db-implementation-plan.md)
   — phase status, what's done, what's deferred.
+- [`docs/grexa-db-scaling-rnd.md`](docs/grexa-db-scaling-rnd.md) — scaling R&D:
+  the parallel scan, the held secondary index, and the measured numbers.
 
 ## Build
 
